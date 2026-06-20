@@ -341,21 +341,83 @@ class RdsJdbcCompatTest {
         }
     }
 
+    @Test
+    @Order(7)
+    @DisplayName("Connect to a database different from the create-time DBName")
+    void connectToDatabaseDifferentFromCreateDbName() throws Exception {
+        assumeInstanceCreated();
+        String altDb = "auth_db";
+
+        // Provision the logical database inside the backing PG container by connecting
+        // to the create-time database as master and issuing CREATE DATABASE. The proxy
+        // authenticates as master, so the master user (a superuser in the container)
+        // can create databases.
+        try (Connection admin = awaitPostgresConnection(USERNAME, PASSWORD, proxyPort, DATABASE)) {
+            try (Statement statement = admin.createStatement()) {
+                statement.execute("CREATE DATABASE " + altDb);
+            }
+        }
+
+        try {
+            // Connect to the alternate database — the proxy must forward the client's
+            // requested database to the backend rather than rewriting it to the
+            // create-time DBName.
+            Connection connection = awaitPostgresConnection(USERNAME, PASSWORD, proxyPort, altDb);
+            try {
+                assertThat(currentDatabase(connection)).isEqualTo(altDb);
+            } finally {
+                connection.close();
+            }
+        } finally {
+            // Best-effort cleanup: terminate any lingering sessions on the alternate
+            // database and drop it. The instance is deleted in @AfterAll regardless.
+            try (Connection admin = openPostgresConnection(USERNAME, PASSWORD, proxyPort, DATABASE)) {
+                try (Statement statement = admin.createStatement()) {
+                    statement.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                            + "WHERE datname = '" + altDb + "' AND pid <> pg_backend_pid()");
+                    statement.execute("DROP DATABASE IF EXISTS " + altDb);
+                }
+            } catch (SQLException ignored) {
+                // Best-effort cleanup; the instance is deleted in @AfterAll anyway.
+            }
+        }
+    }
+
+    @Test
+    @Order(8)
+    @DisplayName("Non-existent database yields the real PostgreSQL 3D000 error")
+    void nonExistentDatabaseReturnsRealPgError() throws Exception {
+        assumeInstanceCreated();
+
+        // The proxy must forward the requested (non-existent) database to the backend,
+        // which emits an ErrorResponse with SQLSTATE 3D000 (invalid_catalog_name).
+        // The proxy must forward that error directly without a spurious AuthenticationOK.
+        assertThatThrownBy(() -> openPostgresConnection(USERNAME, PASSWORD, proxyPort, "missing_db"))
+                .isInstanceOf(SQLException.class)
+                .extracting("SQLState")
+                .isEqualTo("3D000");
+    }
+
     private static void assumeInstanceCreated() {
         Assumptions.assumeTrue(instanceCreated && proxyPort != null,
                 "RDS JDBC tests require a created DB instance from the first step");
     }
 
     private static Connection awaitPostgresConnection(String username, String password) throws Exception {
-        return awaitPostgresConnection(username, password, proxyPort);
+        return awaitPostgresConnection(username, password, proxyPort, DATABASE);
     }
 
     private static Connection awaitPostgresConnection(String username, String password, int port) throws Exception {
+        return awaitPostgresConnection(username, password, port, DATABASE);
+    }
+
+    private static Connection awaitPostgresConnection(String username, String password, int port, String database)
+            throws Exception {
         Instant deadline = Instant.now().plus(Duration.ofSeconds(60));
         SQLException last = null;
         while (Instant.now().isBefore(deadline)) {
             try {
-                return openPostgresConnection(username, password, port);
+                return openPostgresConnection(username, password, port, database);
             } catch (SQLException e) {
                 last = e;
                 Thread.sleep(1000);
@@ -365,17 +427,22 @@ class RdsJdbcCompatTest {
     }
 
     private static Connection openPostgresConnection(String username, String password) throws SQLException {
-        return openPostgresConnection(username, password, proxyPort);
+        return openPostgresConnection(username, password, proxyPort, DATABASE);
     }
 
     private static Connection openPostgresConnection(String username, String password, int port) throws SQLException {
+        return openPostgresConnection(username, password, port, DATABASE);
+    }
+
+    private static Connection openPostgresConnection(String username, String password, int port, String database)
+            throws SQLException {
         Properties properties = new Properties();
         properties.setProperty("user", username);
         properties.setProperty("password", password);
         properties.setProperty("sslmode", "disable");
         properties.setProperty("connectTimeout", "5");
         return DriverManager.getConnection(
-                "jdbc:postgresql://" + TestFixtures.proxyHost() + ":" + port + "/" + DATABASE,
+                "jdbc:postgresql://" + TestFixtures.proxyHost() + ":" + port + "/" + database,
                 properties);
     }
 
@@ -384,6 +451,14 @@ class RdsJdbcCompatTest {
              ResultSet resultSet = statement.executeQuery("select 1")) {
             assertThat(resultSet.next()).isTrue();
             return resultSet.getInt(1);
+        }
+    }
+
+    private static String currentDatabase(Connection connection) throws SQLException {
+        try (Statement statement = connection.createStatement();
+             ResultSet resultSet = statement.executeQuery("SELECT current_database()")) {
+            assertThat(resultSet.next()).isTrue();
+            return resultSet.getString(1);
         }
     }
 }

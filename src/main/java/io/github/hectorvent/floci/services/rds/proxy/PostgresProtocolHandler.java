@@ -127,7 +127,10 @@ public class PostgresProtocolHandler {
         InputStream backendIn = backend.getInputStream();
         OutputStream backendOut = backend.getOutputStream();
 
-        String effectiveDbName = (dbName != null && !dbName.isBlank()) ? dbName : "postgres";
+        String instanceDb = (dbName != null && !dbName.isBlank()) ? dbName : "postgres";
+        String clientDatabase = startup.database();
+        String effectiveDbName = (clientDatabase != null && !clientDatabase.isBlank())
+                ? clientDatabase : instanceDb;
         String backendUser = (isIam || isMaster) ? masterUsername : clientUsername;
         String backendPass = (isIam || isMaster) ? masterPassword : clientPassword;
         sendStartupToBackend(backendOut, backendUser, effectiveDbName);
@@ -144,6 +147,19 @@ public class PostgresProtocolHandler {
 
         // Buffer all backend messages until ReadyForQuery ('Z')
         List<byte[]> bufferedMessages = readUntilReadyForQuery(backendIn);
+
+        // Error-path guard: a backend ErrorResponse (e.g. 3D000 for a non-existent
+        // database) is returned in the buffer. Forward it to the client directly,
+        // without a spurious AuthenticationOK that would confuse the client.
+        if (!bufferedMessages.isEmpty() && bufferedMessages.get(0)[0] == 'E') {
+            for (byte[] msg : bufferedMessages) {
+                clientOut.write(msg);
+            }
+            clientOut.flush();
+            closeQuietly(client);
+            closeQuietly(backend);
+            return;
+        }
 
         // Phase 6: Send AuthenticationOK to client, forward buffered messages, then bridge
         sendMessage(clientOut, 'R', intBytes(0)); // AuthenticationOK
@@ -183,7 +199,8 @@ public class PostgresProtocolHandler {
             byte[] payload = new byte[length - 8];
             readFully(in, payload);
             Map<String, String> params = parseStartupParams(payload);
-            return new StartupMessage(currentSocket, params.getOrDefault("user", "postgres"));
+            return new StartupMessage(currentSocket,
+                    params.getOrDefault("user", "postgres"), params.get("database"));
         }
     }
 
@@ -257,7 +274,7 @@ public class PostgresProtocolHandler {
         return context;
     }
 
-    private record StartupMessage(Socket socket, String username) {}
+    private record StartupMessage(Socket socket, String username, String database) {}
 
     private static Map<String, String> parseStartupParams(byte[] data) {
         Map<String, String> params = new HashMap<>();
